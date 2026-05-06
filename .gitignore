@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Triton compiler cache
+.triton/
+
+# Profiling artifacts
+*.json
+profile_*/
+
+# External research material (cloned upstream code, not our work)
+*/tilelang_reference/
+*/.flaggems_research/
+
+# OS
+.DS_Store

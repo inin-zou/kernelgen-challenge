@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Triton compiler cache
+.triton/
+
+# Profiling artifacts
+*.json
+profile_*/

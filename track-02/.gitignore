@@ -1,0 +1,16 @@
+# TileLang upstream — read-only reference, not part of our work
+tilelang_reference/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Triton compiler cache
+.triton/
+~/.triton/
+
+# Profiling artifacts
+*.json
+profile_*/
