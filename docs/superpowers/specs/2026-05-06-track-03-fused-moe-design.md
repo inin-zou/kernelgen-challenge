@@ -71,40 +71,47 @@ intermediate, w2 [E,K,N], topk_weights, topk_ids
 - **Inputs:** `hidden [M, K]` bf16, `w1 [E, 2N, K]` bf16, `topk_ids [M, topk]` int32
 - **Outputs:** `intermediate [M·topk, N]` bf16
 - **Grid (tensor-core backends Hygon / Iluvatar / MetaX / MTT):** `(M·topk, ceil(N / BLOCK_N))` 2D
-- **Grid (Ascend):** `(ceil(N / BLOCK_N),)` 1D — single program, inner loop over all `M·topk` pairs
-- **Per program (tensor-core path):** decode `(m, k_idx) = divmod(pid_0, topk)`. Load `e = topk_ids[m, k_idx]`. Load `hidden[m, :]` into a `[BLOCK_MK, K]` tile padded by row replication (rows 1..BLOCK_MK-1 are duplicates of row 0; we only use row 0 of the output). For each K-chunk, load `w1[e, n_block_gate, :]` and `w1[e, n_block_up, :]` of shape `[BLOCK_N, K_CHUNK]`, do two `tl.dot`s to produce gate and up vectors, then store `silu(gate) * up` into `intermediate[m·topk + k_idx, n_block]`.
-- **Per program (Ascend path, scalar reduce):** same logic but use `acc = tl.sum(hidden_tile[None,:] * w1_tile, axis=1)` instead of `tl.dot`. No padding waste because there are no tensor cores to feed.
-- **Padding waste:** `BLOCK_MK = 16` (Hygon/Iluvatar/MetaX) → 15/16 wasted tl.dot lanes; `BLOCK_MK = 32` (MTT SQMMA floor) → 31/32 wasted. Tensor cores are 5–10× faster than scalar, so net is still a win on those backends.
+- **Grid (Ascend):** `(ceil(N / BLOCK_N),)` 1D — `ceil(1024 / BLOCK_N)` programs (e.g. 8 with `BLOCK_N=128`), each looping over all `M·topk` token-expert pairs in its inner loop
+- **Per program (tensor-core path):** decode `(m, k_idx) = divmod(pid_0, topk)`. Load `e = topk_ids[m, k_idx]`. Initialize `acc_gate, acc_up = zeros([BLOCK_MK, BLOCK_N], fp32)`. Loop over K in `BLOCK_K`-sized chunks: load `hidden[m, k_chunk]` broadcast/replicated into a `[BLOCK_MK, BLOCK_K]` tile, load `w1[e, n_gate_tile, k_chunk]` and `w1[e, n_up_tile, k_chunk]` as `[BLOCK_N, BLOCK_K]` tiles, accumulate `acc_gate += tl.dot(hidden_tile, w1_gate.T)` and same for up. After the K loop, compute `silu(acc_gate) * acc_up`, take row 0, store to `intermediate[m·topk + k_idx, n_block]`.
+- **Per program (Ascend path, scalar reduce):** same K-chunked outer loop but with `BLOCK_MK=1` (one token row, no padding) and `acc += tl.sum(hidden_chunk[None, :] * w1_chunk, axis=1)` instead of `tl.dot`.
+- **Padding semantics:** `BLOCK_MK` is the *minimum row count `tl.dot` accepts* on each backend (16 on Hygon/Iluvatar/MetaX, 32 on MTT/SQMMA). The "M dim" of our matmul is logically 1 (single token); rows 1..BLOCK_MK−1 are replicas of row 0 so the dot still produces the right value in row 0. Tensor-core hardware does the padded tile shape regardless of how many "real" rows you have, so this is not wasted FLOPs — it's the hardware floor.
+- **UB pressure (Ascend):** `BLOCK_N × BLOCK_K × 2 = 128·128·2 = 32 KB` per w1 tile. Two w1 tiles + one hidden tile fit comfortably under Ascend's ~192 KB UB. `BLOCK_K=128` is the seed; revisit if Ascend complains.
 
 ### Kernel C — down + topk-reduce
 
 - **Inputs:** `intermediate [M·topk, N]` bf16, `w2 [E, K, N]` bf16, `topk_weights [M, topk]` bf16, `topk_ids [M, topk]` int32
 - **Outputs:** `output [M, K]` bf16
 - **Grid (tensor-core backends):** `(M, ceil(K / BLOCK_K_OUT))` 2D
-- **Grid (Ascend):** `(ceil(K / BLOCK_K_OUT),)` 1D — single program, inner loop over all M
-- **Per program:** for each `(m, k_block)`:
+- **Grid (Ascend):** `(ceil(K / BLOCK_K_OUT),)` 1D — `ceil(2048 / BLOCK_K_OUT)` programs (e.g. 16 with `BLOCK_K_OUT=128`), each looping over all M tokens in its inner loop
+- **Per program (tensor-core path):** owns one `(m, k_block)` pair (or all m on Ascend). Loop over `k_idx in range(topk)`:
   ```
-  acc = zeros([BLOCK_K_OUT], fp32)
+  acc = zeros([BLOCK_MK, BLOCK_K_OUT], fp32)
   for k_idx in range(topk):
-      e   = topk_ids[m, k_idx]
-      w_t = topk_weights[m, k_idx].to(fp32)
-      mid = intermediate[m·topk + k_idx, :N]                # bf16, broadcast row
-      w2_tile = w2[e, k_block, :N]                          # [BLOCK_K_OUT, N]
-      acc += w_t * tl.dot(mid_padded, w2_tile.T, fp32)      # tensor-core path
-      # or acc += w_t * tl.sum(mid[None,:] * w2_tile, axis=1)  # Ascend path
-  output[m, k_block] = acc.to(bf16)
+      e   = topk_ids[m, k_idx]                              # scalar int32
+      w_t = topk_weights[m, k_idx].to(fp32)                 # scalar fp32
+      # K-loop over the N reduction dim:
+      partial = zeros([BLOCK_MK, BLOCK_K_OUT], fp32)
+      for n_chunk in range(0, N, BLOCK_N_R):
+          mid_tile = intermediate[m·topk + k_idx, n_chunk:n_chunk+BLOCK_N_R]
+                     replicated to [BLOCK_MK, BLOCK_N_R]
+          w2_tile  = w2[e, k_block, n_chunk:n_chunk+BLOCK_N_R]   # [BLOCK_K_OUT, BLOCK_N_R]
+          partial += tl.dot(mid_tile, w2_tile.T, fp32)
+      acc += w_t * partial
+  output[m, k_block] = acc[0, :].to(bf16)
   ```
-- This is the only place topk experts combine. No atomics needed because each `(m, k_block)` pair is owned by exactly one program.
+- **Per program (Ascend path):** `BLOCK_MK=1`, replace `tl.dot` with `tl.sum(mid_chunk[None, :] * w2_chunk, axis=1)`, outer loop over m as well as k_idx.
+- This is the only place topk experts combine. No atomics needed because each `(m, k_block)` pair is owned by exactly one program (or one outer-loop iteration on Ascend).
+- **`BLOCK_N_R`** is the chunk size used to reduce over the intermediate's N dim (same role as `BLOCK_K` in Kernel B, but the GEMM's reduction axis here is `N`, not `K`). Seed: 64 on tensor-core backends, 128 on Ascend.
 
 ## Per-backend dispatch table
 
 | Backend     | Detect              | Kernel B path | Kernel B blocks                          | Kernel C path | Notes |
 |-------------|---------------------|---------------|------------------------------------------|---------------|-------|
-| Ascend      | `npu`               | scalar reduce | 1D grid over N tiles, long inner loop    | scalar reduce | 32 vector cores → few programs. No autotune. Static fallback always. |
-| Hygon       | `hip`               | tl.dot        | `BLOCK_MK=16, BLOCK_N=128, num_warps=4`  | tl.dot        | Standard NV-style, hundreds of CUs. |
-| Iluvatar    | `cuda` ∧ ¬musa      | tl.dot        | `BLOCK_MK=16, BLOCK_N=128, num_warps=2, num_stages=1` | tl.dot | FlagGems _iluvatar pattern. |
-| MTT         | `musa`              | tl.dot        | `BLOCK_MK=32, BLOCK_N=128, num_warps=8`  | tl.dot        | SQMMA floor 32. `MUSA_ENABLE_SQMMA=1` env. Bypass autotune. |
-| MetaX       | `maca`              | tl.dot        | `BLOCK_MK=16, BLOCK_N=64, num_warps=2, num_stages=1` | tl.dot | `tl.dot(..., acc=acc)` form. `TRITON_DISABLE_SWIZZLE=1`. Bypass autotune. Expected 0.2–0.5× — same fundamental mismatch as track-01. |
+| Ascend      | `npu`               | scalar reduce | `BLOCK_MK=1, BLOCK_N=128, BLOCK_K=128, num_warps=2`  | scalar reduce | 32 vector cores → few programs. 1D grid, long inner loop over `M·topk`. No autotune. Static path only. |
+| Hygon       | `hip`               | tl.dot        | `BLOCK_MK=16, BLOCK_N=128, BLOCK_K=64, num_warps=4`  | tl.dot        | Standard NV-style, hundreds of CUs. 2D grid. |
+| Iluvatar    | `cuda` ∧ ¬musa      | tl.dot        | `BLOCK_MK=16, BLOCK_N=128, BLOCK_K=64, num_warps=2, num_stages=1` | tl.dot | FlagGems _iluvatar pattern. |
+| MTT         | `musa`              | tl.dot        | `BLOCK_MK=32, BLOCK_N=128, BLOCK_K=64, num_warps=8`  | tl.dot        | SQMMA floor 32. `MUSA_ENABLE_SQMMA=1` env. Bypass autotune. |
+| MetaX       | `maca`              | tl.dot        | `BLOCK_MK=16, BLOCK_N=64,  BLOCK_K=64, num_warps=2, num_stages=1` | tl.dot | `tl.dot(..., acc=acc)` form. `TRITON_DISABLE_SWIZZLE=1`. Bypass autotune. Expected 0.2–0.5× — same fundamental mismatch as track-01. |
 
 Block sizes are seed values from track-01/02 lessons + FlagGems patterns. Fine-tuning happens in v2 once we have v1 platform numbers.
 
