@@ -194,6 +194,132 @@ def _launch_routing(score, topk, renormalize, M, E):
     return topk_w, topk_id
 
 
+# ---------------------------------------------------------------------------
+# Kernel B — gate+up + SiLU
+# Inputs : hidden [M, K] bf16, w1 [E, 2N, K] bf16, topk_id [M, TOPK] int32
+# Outputs: intermediate [M*TOPK, N] bf16
+# Tensor-core grid : (M*TOPK, ceil(N / BLOCK_N))
+# Ascend grid      : (ceil(N / BLOCK_N),)  — inner loop over M*TOPK
+# ---------------------------------------------------------------------------
+@triton.jit
+def _gateup_silu_kernel(
+    hidden_ptr,          # [M, K]
+    w1_ptr,              # [E, 2N, K]
+    topk_id_ptr,         # [M, TOPK]
+    inter_ptr,           # [M*TOPK, N]
+    M, MK,               # MK = M * TOPK
+    K:     tl.constexpr,
+    N:     tl.constexpr,
+    TWO_N: tl.constexpr,
+    TOPK:  tl.constexpr,
+    BLOCK_MK: tl.constexpr,
+    BLOCK_N:  tl.constexpr,
+    BLOCK_K:  tl.constexpr,
+    IS_ASCEND: tl.constexpr,
+):
+    if IS_ASCEND:
+        # 1D grid, one program per N tile. Inner runtime loop over MK pairs.
+        pid_n = tl.program_id(0)
+        n_off = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_mask = n_off < N
+
+        for mk in range(MK):
+            m = mk // TOPK
+            k_idx = mk % TOPK
+            e = tl.load(topk_id_ptr + m * TOPK + k_idx)
+
+            acc_g = tl.zeros([BLOCK_N], tl.float32)
+            acc_u = tl.zeros([BLOCK_N], tl.float32)
+
+            for k_chunk in range(0, K, BLOCK_K):
+                k_off = k_chunk + tl.arange(0, BLOCK_K)
+                k_msk = k_off < K
+
+                h = tl.load(hidden_ptr + m * K + k_off, mask=k_msk, other=0.0).to(tl.float32)
+
+                w1g_off = e * (TWO_N * K) + n_off[:, None] * K + k_off[None, :]
+                w1g_msk = n_mask[:, None] & k_msk[None, :]
+                w1g = tl.load(w1_ptr + w1g_off, mask=w1g_msk, other=0.0).to(tl.float32)
+
+                w1u_off = e * (TWO_N * K) + (N + n_off)[:, None] * K + k_off[None, :]
+                w1u_msk = n_mask[:, None] & k_msk[None, :]
+                w1u = tl.load(w1_ptr + w1u_off, mask=w1u_msk, other=0.0).to(tl.float32)
+
+                acc_g += tl.sum(h[None, :] * w1g, axis=1)
+                acc_u += tl.sum(h[None, :] * w1u, axis=1)
+
+            silu_g = acc_g * tl.sigmoid(acc_g)
+            out = (silu_g * acc_u).to(tl.bfloat16)
+
+            tl.store(inter_ptr + mk * N + n_off, out, mask=n_mask)
+    else:
+        # Tensor-core path: 2D grid (MK, n_tile). One program per token-expert pair × n tile.
+        pid_mk = tl.program_id(0)
+        pid_n  = tl.program_id(1)
+
+        m     = pid_mk // TOPK
+        k_idx = pid_mk % TOPK
+        e = tl.load(topk_id_ptr + m * TOPK + k_idx)
+
+        n_off = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_mask = n_off < N
+
+        acc_g = tl.zeros([BLOCK_MK, BLOCK_N], tl.float32)
+        acc_u = tl.zeros([BLOCK_MK, BLOCK_N], tl.float32)
+
+        for k_chunk in range(0, K, BLOCK_K):
+            k_off = k_chunk + tl.arange(0, BLOCK_K)
+            k_msk = k_off < K
+
+            # Hidden tile: replicate row [m,:] across all BLOCK_MK lanes (only lane 0 is real).
+            h_row = tl.load(hidden_ptr + m * K + k_off, mask=k_msk, other=0.0)
+            h_tile = tl.broadcast_to(h_row[None, :], (BLOCK_MK, BLOCK_K))
+
+            w1g_off = e * (TWO_N * K) + n_off[:, None] * K + k_off[None, :]
+            w1g_msk = n_mask[:, None] & k_msk[None, :]
+            w1g = tl.load(w1_ptr + w1g_off, mask=w1g_msk, other=0.0)
+
+            w1u_off = e * (TWO_N * K) + (N + n_off)[:, None] * K + k_off[None, :]
+            w1u_msk = n_mask[:, None] & k_msk[None, :]
+            w1u = tl.load(w1_ptr + w1u_off, mask=w1u_msk, other=0.0)
+
+            acc_g += tl.dot(h_tile, tl.trans(w1g), out_dtype=tl.float32)
+            acc_u += tl.dot(h_tile, tl.trans(w1u), out_dtype=tl.float32)
+
+        silu_g = acc_g * tl.sigmoid(acc_g)
+        out = (silu_g * acc_u).to(tl.bfloat16)  # [BLOCK_MK, BLOCK_N]
+
+        out_row0 = out[0, :]
+        tl.store(inter_ptr + pid_mk * N + n_off, out_row0, mask=n_mask)
+
+
+def _launch_gateup_silu(hidden, w1, topk_id, intermediate, M, K, N, topk):
+    cfg = _gateup_cfg()
+    BLOCK_MK = cfg["BLOCK_MK"]
+    BLOCK_N  = cfg["BLOCK_N"]
+    BLOCK_K  = cfg["BLOCK_K"]
+
+    MK = M * topk
+
+    if _is_ascend():
+        grid = (triton.cdiv(N, BLOCK_N),)
+    else:
+        grid = (MK, triton.cdiv(N, BLOCK_N))
+
+    _gateup_silu_kernel[grid](
+        hidden, w1, topk_id, intermediate,
+        M, MK,
+        K=K, N=N, TWO_N=2 * N,
+        TOPK=topk,
+        BLOCK_MK=BLOCK_MK,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        IS_ASCEND=_is_ascend(),
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
+    )
+
+
 def fused_moe(hidden_states, w1, w2, score, topk, renormalize=False):
     """Stub — kernels added in subsequent commits."""
     raise NotImplementedError("v1 kernels not yet wired")
