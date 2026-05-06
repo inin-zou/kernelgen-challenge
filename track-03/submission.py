@@ -437,5 +437,43 @@ def _launch_down_reduce(intermediate, w2, topk_w, topk_id, output, M, K, N, topk
 
 
 def fused_moe(hidden_states, w1, w2, score, topk, renormalize=False):
-    """Stub — kernels added in subsequent commits."""
-    raise NotImplementedError("v1 kernels not yet wired")
+    """Fused MoE — entry point called by the judge.
+
+    Args:
+        hidden_states: [M, K]    bf16
+        w1:            [E, 2N, K] bf16
+        w2:            [E, K, N]  bf16
+        score:         [M, E]    bf16
+        topk:          int
+        renormalize:   bool (default False)
+
+    Returns:
+        output:        [M, K]    bf16
+    """
+    assert hidden_states.dim() == 2
+    assert w1.dim() == 3
+    assert w2.dim() == 3
+    assert score.dim() == 2
+    M, K = hidden_states.shape
+    E_w1, two_N, K_w1 = w1.shape
+    E_w2, K_w2, N = w2.shape
+    M_s, E_s = score.shape
+    assert E_w1 == E_w2 == E_s, f"E mismatch: w1={E_w1} w2={E_w2} score={E_s}"
+    assert K == K_w1 == K_w2,   f"K mismatch: hidden={K} w1={K_w1} w2={K_w2}"
+    assert two_N == 2 * N,      f"w1.shape[1] must be 2*w2.shape[2]; got {two_N} vs {2 * N}"
+    assert M_s == M,            f"score rows {M_s} != hidden rows {M}"
+    E = E_w1
+
+    hidden_c = hidden_states.contiguous()
+    w1_c     = w1.contiguous()
+    w2_c     = w2.contiguous()
+    score_c  = score.contiguous()
+
+    intermediate = torch.empty(M * topk, N, dtype=hidden_states.dtype, device=hidden_states.device)
+    output       = torch.empty(M, K,         dtype=hidden_states.dtype, device=hidden_states.device)
+
+    topk_w, topk_id = _launch_routing(score_c, topk, renormalize, M, E)
+    _launch_gateup_silu(hidden_c, w1_c, topk_id, intermediate, M, K, N, topk)
+    _launch_down_reduce(intermediate, w2_c, topk_w, topk_id, output, M, K, N, topk)
+
+    return output
