@@ -17,3 +17,6 @@ profile_*/
 
 # OS
 .DS_Store
+
+# Claude Code local settings (user-specific, may contain secrets)
+.claude/settings.local.json
