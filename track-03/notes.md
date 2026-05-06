@@ -46,6 +46,51 @@ reference by a comfortable margin on these shapes.
 - Fused routing+gateup (skip `topk_ids` round trip).
 - MetaX exploration beyond the defensive seed config.
 
-### Submission pending
+### v1 result
 
-(Fill in per-backend numbers after first platform run.)
+| Backend  | Speedup |
+|----------|---------|
+| Ascend   | Failed  |
+| Iluvatar | Failed  |
+| Hygon    | Failed  |
+| MTT      | Failed  |
+| MetaX    | Failed  |
+
+Universal failure across all 5 backends → almost certainly a Triton API used
+by code that runs on every backend. No per-backend log fetched, so v2 is a
+blind defensive pass at the most likely culprits.
+
+## v2 (2026-05-06) — defensive API portability fixes
+
+Three changes:
+
+1. **Routing kernel: drop `tl.argmax`.** Replaced with `tl.max` + sentinel-min
+   pattern (encode each position by its index, set non-max positions to a
+   sentinel = E, take row min). `tl.argmax` is the most-recent API in v1 and
+   the most likely to be missing or buggy on Triton-Ascend / mcTriton / muTriton.
+
+2. **Kernels B and C: drop `tl.broadcast_to`.** The hidden/intermediate row
+   was being broadcast to `[BLOCK_MK, BLOCK_K]` via `tl.broadcast_to`.
+   Replaced with pointer-arithmetic 2D loads:
+
+       mk_lane = tl.arange(0, BLOCK_MK)
+       h_off_2d = m * K + mk_lane[:, None] * 0 + k_off[None, :]
+       h_tile   = tl.load(hidden_ptr + h_off_2d, mask=..., other=0.0)
+
+   The `mk_lane * 0` introduces the `BLOCK_MK` row dim into pointer arithmetic
+   without changing values. Wider compiler support across Triton forks.
+
+3. **`tl.dot(..., acc=acc)` form** instead of `acc += tl.dot(...)`. Track-01
+   lesson: this fuses the accumulator on MetaX for ~30% perf on the dot path.
+   Functionally equivalent on other backends.
+
+### v2 expectations
+
+Best case: all 5 backends now compile and run, producing v1's intended speedups
+(Hygon/Iluvatar/MTT ≥ 2x, Ascend ≥ 1x, MetaX ≥ 0.3x).
+
+Worst case: still failing — meaning the issue is something else (most likely
+candidates if v2 fails: `if IS_ASCEND:` constexpr branch, `tl.dot` `acc=`
+keyword unsupported on some fork, or runtime loop bound issue on Ascend).
+
+(Fill in per-backend numbers after v2 platform run.)

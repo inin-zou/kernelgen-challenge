@@ -1,6 +1,13 @@
 """
 Submission file for GOSIM KernelGen Track-03: Fused MoE.
 
+v2: defensive API portability fixes after v1 universal failure on platform.
+- routing kernel: replace tl.argmax with tl.max + sentinel-min gather
+  (tl.argmax appears flaky on at least one of the 5 forks).
+- kernels B/C tensor-core path: replace tl.broadcast_to with pointer-
+  arithmetic 2D loads (using `mk_lane * 0 + ...`).
+- tl.dot now uses the `acc=` form (track-01 lesson — helps MetaX).
+
 v1: hybrid (option C) — one universal @triton.jit pipeline with per-backend
 grid shape and BLOCK_* constants. Three kernels, no atomics, no permutation,
 no autotune.
@@ -150,11 +157,15 @@ def _routing_kernel(
     s_sum = tl.sum(s, axis=1)
     weights = s / s_sum[:, None]              # [BLOCK_M, E] fp32
 
-    # iterative topk: argmax → store → mask the chosen index with -inf
+    # iterative topk: max-value + position-encoded gather (no tl.argmax — fork-portable)
     sum_topk = tl.zeros([BLOCK_M], tl.float32)
     for k in tl.static_range(TOPK):
-        idx_max = tl.argmax(weights, axis=1)                # [BLOCK_M]
-        gather_mask = (e[None, :] == idx_max[:, None])      # [BLOCK_M, E]
+        m_val = tl.max(weights, axis=1)                                  # [BLOCK_M]
+        is_max = (weights == m_val[:, None])                             # [BLOCK_M, E]
+        # leftmost match: encode position, sentinel = E for non-matches, take row min
+        idx_with_sentinel = tl.where(is_max, e[None, :], E)              # int
+        idx_max = tl.min(idx_with_sentinel, axis=1)                      # [BLOCK_M]
+        gather_mask = (e[None, :] == idx_max[:, None])                   # [BLOCK_M, E]
         w_chosen = tl.sum(tl.where(gather_mask, weights, 0.0), axis=1)
         sum_topk += w_chosen
 
@@ -267,13 +278,18 @@ def _gateup_silu_kernel(
         acc_g = tl.zeros([BLOCK_MK, BLOCK_N], tl.float32)
         acc_u = tl.zeros([BLOCK_MK, BLOCK_N], tl.float32)
 
+        # mk_lane introduces the BLOCK_MK row dim into pointer arithmetic
+        # (replaces tl.broadcast_to — works on every Triton fork).
+        mk_lane = tl.arange(0, BLOCK_MK)
+
         for k_chunk in range(0, K, BLOCK_K):
             k_off = k_chunk + tl.arange(0, BLOCK_K)
             k_msk = k_off < K
 
-            # Hidden tile: replicate row [m,:] across all BLOCK_MK lanes (only lane 0 is real).
-            h_row = tl.load(hidden_ptr + m * K + k_off, mask=k_msk, other=0.0)
-            h_tile = tl.broadcast_to(h_row[None, :], (BLOCK_MK, BLOCK_K))
+            # Replicate hidden[m, k_off] across BLOCK_MK rows via 0 * mk_lane.
+            h_off_2d = m * K + mk_lane[:, None] * 0 + k_off[None, :]
+            h_msk_2d = (mk_lane[:, None] >= 0) & k_msk[None, :]
+            h_tile = tl.load(hidden_ptr + h_off_2d, mask=h_msk_2d, other=0.0)
 
             w1g_off = e * (TWO_N * K) + n_off[:, None] * K + k_off[None, :]
             w1g_msk = n_mask[:, None] & k_msk[None, :]
@@ -283,8 +299,8 @@ def _gateup_silu_kernel(
             w1u_msk = n_mask[:, None] & k_msk[None, :]
             w1u = tl.load(w1_ptr + w1u_off, mask=w1u_msk, other=0.0)
 
-            acc_g += tl.dot(h_tile, tl.trans(w1g), out_dtype=tl.float32)
-            acc_u += tl.dot(h_tile, tl.trans(w1u), out_dtype=tl.float32)
+            acc_g = tl.dot(h_tile, tl.trans(w1g), acc=acc_g, out_dtype=tl.float32)
+            acc_u = tl.dot(h_tile, tl.trans(w1u), acc=acc_u, out_dtype=tl.float32)
 
         silu_g = acc_g * tl.sigmoid(acc_g)
         out = (silu_g * acc_u).to(tl.bfloat16)  # [BLOCK_MK, BLOCK_N]
@@ -385,6 +401,9 @@ def _down_reduce_kernel(
 
         acc = tl.zeros([BLOCK_MK, BLOCK_K_OUT], tl.float32)
 
+        # mk_lane: pointer-arithmetic broadcast row dim (replaces tl.broadcast_to).
+        mk_lane = tl.arange(0, BLOCK_MK)
+
         for k_idx in tl.static_range(TOPK):
             e = tl.load(topk_id_ptr + m * TOPK + k_idx)
             w_t = tl.load(topk_w_ptr + m * TOPK + k_idx).to(tl.float32)
@@ -394,17 +413,16 @@ def _down_reduce_kernel(
                 n_off = n_chunk + tl.arange(0, BLOCK_N_R)
                 n_msk = n_off < N
 
-                mid_row = tl.load(
-                    inter_ptr + (m * TOPK + k_idx) * N + n_off,
-                    mask=n_msk, other=0.0,
-                )
-                mid_tile = tl.broadcast_to(mid_row[None, :], (BLOCK_MK, BLOCK_N_R))
+                # Replicate intermediate[m*TOPK+k_idx, n_off] across BLOCK_MK rows
+                mid_off_2d = (m * TOPK + k_idx) * N + mk_lane[:, None] * 0 + n_off[None, :]
+                mid_msk_2d = (mk_lane[:, None] >= 0) & n_msk[None, :]
+                mid_tile = tl.load(inter_ptr + mid_off_2d, mask=mid_msk_2d, other=0.0)
 
                 w2_off = e * (K * N) + k_out_off[:, None] * N + n_off[None, :]
                 w2_msk = k_out_mask[:, None] & n_msk[None, :]
                 w2t = tl.load(w2_ptr + w2_off, mask=w2_msk, other=0.0)
 
-                partial += tl.dot(mid_tile, tl.trans(w2t), out_dtype=tl.float32)
+                partial = tl.dot(mid_tile, tl.trans(w2t), acc=partial, out_dtype=tl.float32)
 
             acc += w_t * partial
 
