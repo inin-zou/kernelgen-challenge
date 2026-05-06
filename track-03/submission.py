@@ -111,6 +111,89 @@ def _down_cfg():
     return _CFG_DOWN_ILUVATAR
 
 
+# ---------------------------------------------------------------------------
+# Kernel A — routing: softmax + iterative topk
+# Inputs : score [M, E] (bf16)
+# Outputs: topk_w [M, topk] (bf16), topk_id [M, topk] (int32)
+# Grid   : (ceil(M / BLOCK_M),)
+# ---------------------------------------------------------------------------
+@triton.jit
+def _routing_kernel(
+    score_ptr,           # [M, E_REAL]
+    topk_w_ptr,          # [M, TOPK]
+    topk_id_ptr,         # [M, TOPK]
+    M,
+    RENORMALIZE: tl.constexpr,
+    E:      tl.constexpr,   # power-of-2 padded width
+    E_REAL: tl.constexpr,   # actual number of experts
+    TOPK:    tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m < M
+
+    e = tl.arange(0, E)
+    e_mask = e < E_REAL
+
+    NEG_INF = float('-inf')
+
+    # Load score with -inf padding for both row and column edges.
+    s_off = m[:, None] * E_REAL + e[None, :]
+    s_load_mask = m_mask[:, None] & e_mask[None, :]
+    s = tl.load(score_ptr + s_off, mask=s_load_mask, other=NEG_INF).to(tl.float32)
+    s = tl.where(e_mask[None, :], s, NEG_INF)
+
+    # softmax over the expert dim
+    s_max = tl.max(s, axis=1)
+    s = tl.exp(s - s_max[:, None])
+    s_sum = tl.sum(s, axis=1)
+    weights = s / s_sum[:, None]              # [BLOCK_M, E] fp32
+
+    # iterative topk: argmax → store → mask the chosen index with -inf
+    sum_topk = tl.zeros([BLOCK_M], tl.float32)
+    for k in tl.static_range(TOPK):
+        idx_max = tl.argmax(weights, axis=1)                # [BLOCK_M]
+        gather_mask = (e[None, :] == idx_max[:, None])      # [BLOCK_M, E]
+        w_chosen = tl.sum(tl.where(gather_mask, weights, 0.0), axis=1)
+        sum_topk += w_chosen
+
+        out_off = m * TOPK + k
+        tl.store(topk_w_ptr  + out_off, w_chosen.to(tl.bfloat16), mask=m_mask)
+        tl.store(topk_id_ptr + out_off, idx_max.to(tl.int32),     mask=m_mask)
+
+        weights = tl.where(gather_mask, NEG_INF, weights)
+
+    # optional renormalize: divide stored weights by their row-sum
+    if RENORMALIZE:
+        for k in tl.static_range(TOPK):
+            w_off = m * TOPK + k
+            w = tl.load(topk_w_ptr + w_off, mask=m_mask, other=0.0).to(tl.float32)
+            w = w / sum_topk
+            tl.store(topk_w_ptr + w_off, w.to(tl.bfloat16), mask=m_mask)
+
+
+def _launch_routing(score, topk, renormalize, M, E):
+    """Allocate outputs and launch the routing kernel."""
+    topk_w  = torch.empty(M, topk, dtype=score.dtype, device=score.device)
+    topk_id = torch.empty(M, topk, dtype=torch.int32, device=score.device)
+
+    E_pow2 = triton.next_power_of_2(E)
+    BLOCK_M = 16
+
+    grid = (triton.cdiv(M, BLOCK_M),)
+    _routing_kernel[grid](
+        score, topk_w, topk_id,
+        M,
+        RENORMALIZE=bool(renormalize),
+        E=E_pow2,
+        E_REAL=E,
+        TOPK=topk,
+        BLOCK_M=BLOCK_M,
+    )
+    return topk_w, topk_id
+
+
 def fused_moe(hidden_states, w1, w2, score, topk, renormalize=False):
     """Stub — kernels added in subsequent commits."""
     raise NotImplementedError("v1 kernels not yet wired")
