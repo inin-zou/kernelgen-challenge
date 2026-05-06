@@ -320,6 +320,122 @@ def _launch_gateup_silu(hidden, w1, topk_id, intermediate, M, K, N, topk):
     )
 
 
+# ---------------------------------------------------------------------------
+# Kernel C — down + topk-reduce
+# Inputs : intermediate [M*TOPK, N] bf16, w2 [E, K, N] bf16,
+#          topk_w [M, TOPK] bf16, topk_id [M, TOPK] int32
+# Outputs: output [M, K] bf16
+# Tensor-core grid : (M, ceil(K / BLOCK_K_OUT))
+# Ascend grid      : (ceil(K / BLOCK_K_OUT),) — inner runtime loop over M
+# ---------------------------------------------------------------------------
+@triton.jit
+def _down_reduce_kernel(
+    inter_ptr,           # [M*TOPK, N]
+    w2_ptr,              # [E, K, N]
+    topk_w_ptr,          # [M, TOPK]
+    topk_id_ptr,         # [M, TOPK]
+    output_ptr,          # [M, K]
+    M,
+    K: tl.constexpr,
+    N: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_MK:    tl.constexpr,
+    BLOCK_K_OUT: tl.constexpr,
+    BLOCK_N_R:   tl.constexpr,
+    IS_ASCEND: tl.constexpr,
+):
+    if IS_ASCEND:
+        pid_k = tl.program_id(0)
+        k_out_off = pid_k * BLOCK_K_OUT + tl.arange(0, BLOCK_K_OUT)
+        k_out_mask = k_out_off < K
+
+        for m in range(M):
+            acc = tl.zeros([BLOCK_K_OUT], tl.float32)
+
+            for k_idx in tl.static_range(TOPK):
+                e = tl.load(topk_id_ptr + m * TOPK + k_idx)
+                w_t = tl.load(topk_w_ptr + m * TOPK + k_idx).to(tl.float32)
+
+                partial = tl.zeros([BLOCK_K_OUT], tl.float32)
+                for n_chunk in range(0, N, BLOCK_N_R):
+                    n_off = n_chunk + tl.arange(0, BLOCK_N_R)
+                    n_msk = n_off < N
+
+                    mid = tl.load(
+                        inter_ptr + (m * TOPK + k_idx) * N + n_off,
+                        mask=n_msk, other=0.0,
+                    ).to(tl.float32)
+
+                    w2_off = e * (K * N) + k_out_off[:, None] * N + n_off[None, :]
+                    w2_msk = k_out_mask[:, None] & n_msk[None, :]
+                    w2t = tl.load(w2_ptr + w2_off, mask=w2_msk, other=0.0).to(tl.float32)
+
+                    partial += tl.sum(mid[None, :] * w2t, axis=1)
+
+                acc += w_t * partial
+
+            tl.store(output_ptr + m * K + k_out_off, acc.to(tl.bfloat16), mask=k_out_mask)
+    else:
+        pid_m = tl.program_id(0)
+        pid_k = tl.program_id(1)
+
+        m = pid_m
+        k_out_off = pid_k * BLOCK_K_OUT + tl.arange(0, BLOCK_K_OUT)
+        k_out_mask = k_out_off < K
+
+        acc = tl.zeros([BLOCK_MK, BLOCK_K_OUT], tl.float32)
+
+        for k_idx in tl.static_range(TOPK):
+            e = tl.load(topk_id_ptr + m * TOPK + k_idx)
+            w_t = tl.load(topk_w_ptr + m * TOPK + k_idx).to(tl.float32)
+
+            partial = tl.zeros([BLOCK_MK, BLOCK_K_OUT], tl.float32)
+            for n_chunk in range(0, N, BLOCK_N_R):
+                n_off = n_chunk + tl.arange(0, BLOCK_N_R)
+                n_msk = n_off < N
+
+                mid_row = tl.load(
+                    inter_ptr + (m * TOPK + k_idx) * N + n_off,
+                    mask=n_msk, other=0.0,
+                )
+                mid_tile = tl.broadcast_to(mid_row[None, :], (BLOCK_MK, BLOCK_N_R))
+
+                w2_off = e * (K * N) + k_out_off[:, None] * N + n_off[None, :]
+                w2_msk = k_out_mask[:, None] & n_msk[None, :]
+                w2t = tl.load(w2_ptr + w2_off, mask=w2_msk, other=0.0)
+
+                partial += tl.dot(mid_tile, tl.trans(w2t), out_dtype=tl.float32)
+
+            acc += w_t * partial
+
+        out_row0 = acc[0, :].to(tl.bfloat16)
+        tl.store(output_ptr + m * K + k_out_off, out_row0, mask=k_out_mask)
+
+
+def _launch_down_reduce(intermediate, w2, topk_w, topk_id, output, M, K, N, topk):
+    cfg = _down_cfg()
+    BLOCK_MK    = cfg["BLOCK_MK"]
+    BLOCK_K_OUT = cfg["BLOCK_K_OUT"]
+    BLOCK_N_R   = cfg["BLOCK_N_R"]
+
+    if _is_ascend():
+        grid = (triton.cdiv(K, BLOCK_K_OUT),)
+    else:
+        grid = (M, triton.cdiv(K, BLOCK_K_OUT))
+
+    _down_reduce_kernel[grid](
+        intermediate, w2, topk_w, topk_id, output,
+        M,
+        K=K, N=N, TOPK=topk,
+        BLOCK_MK=BLOCK_MK,
+        BLOCK_K_OUT=BLOCK_K_OUT,
+        BLOCK_N_R=BLOCK_N_R,
+        IS_ASCEND=_is_ascend(),
+        num_warps=cfg["num_warps"],
+        num_stages=cfg["num_stages"],
+    )
+
+
 def fused_moe(hidden_states, w1, w2, score, topk, renormalize=False):
     """Stub — kernels added in subsequent commits."""
     raise NotImplementedError("v1 kernels not yet wired")
