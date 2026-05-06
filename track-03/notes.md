@@ -84,13 +84,48 @@ Three changes:
    lesson: this fuses the accumulator on MetaX for ~30% perf on the dot path.
    Functionally equivalent on other backends.
 
-### v2 expectations
+### v2 result
 
-Best case: all 5 backends now compile and run, producing v1's intended speedups
-(Hygon/Iluvatar/MTT ≥ 2x, Ascend ≥ 1x, MetaX ≥ 0.3x).
+| Backend  | Speedup |
+|----------|---------|
+| Ascend   | Failed  |
+| Iluvatar | Failed  |
+| Hygon    | Failed  |
+| MTT      | Failed  |
+| MetaX    | Failed  |
 
-Worst case: still failing — meaning the issue is something else (most likely
-candidates if v2 fails: `if IS_ASCEND:` constexpr branch, `tl.dot` `acc=`
-keyword unsupported on some fork, or runtime loop bound issue on Ascend).
+Identical pattern to v1 — universal failure on all 5. That rules out the v2
+hypotheses (`tl.argmax`, `tl.broadcast_to`) since v2 specifically removed both
+and the failure didn't change. The bug is shared by v1 and v2.
 
-(Fill in per-backend numbers after v2 platform run.)
+## v3 (2026-05-06) — minimum-viable diagnostic
+
+Strategy: strip back to the most basic Triton API surface. If v3 still fails
+universally, the bug is in routing or the wrapper, not in the compute kernels.
+If v3 passes anywhere, we know v1/v2's tensor-core paths were the issue.
+
+Changes vs v2:
+
+1. **Drop `tl.dot` entirely.** All "matmul" is now `tl.sum(a[None, :] * b, axis=1)`
+   scalar reduction. ~3–5× slower than tl.dot on tensor-core hardware, but
+   uses only `tl.load`/`tl.store`/`tl.sum`/`tl.max`/`tl.min`/`tl.where`/`tl.exp`/
+   `tl.sigmoid` — every fork's bedrock.
+2. **Drop `IS_ASCEND: tl.constexpr` branching.** One code path everywhere.
+3. **Drop `acc=` and `out_dtype=` keyword args** (gone with tl.dot).
+4. **Drop pointer-arithmetic broadcast tricks** (no 2D tl.dot operand needed).
+5. **Add `TRITON_ALL_BLOCKS_PARALLEL=1`** env var — Ascend's grid > 65535 escape hatch.
+6. **2D grid for both compute kernels on every backend.**
+7. `num_warps=1` on Ascend, 2 elsewhere. Conservative.
+8. `renormalize` arg accepted but ignored in v3 (not on hot path; default False).
+
+### v3 expectations
+
+If v3 passes on at least Hygon/Iluvatar (the most standard Triton): the
+v1/v2 bug was in tensor-core code paths and we re-introduce `tl.dot` carefully
+in v4 with one targeted change at a time.
+
+If v3 still fails everywhere: the bug is in the routing kernel, the wrapper,
+or our backend-detection. Next move would be a routing-only smoke submission
+to isolate further.
+
+(Fill in per-backend numbers after v3 platform run.)
