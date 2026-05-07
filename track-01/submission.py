@@ -1,21 +1,68 @@
 """
 Submission file for GOSIM KernelGen Track-01: Sparse Attention.
 
-v10 changes vs v9 (v9 = 1.55 rank #5):
+v19 changes vs v18 (MetaX still 0.31 — far below leaderboard median 1.5–2.5):
 
-Targeted MetaX + MTT algorithm-level breakthroughs (research-validated):
+Realization: the 0.27 → 0.31 ceiling we hit through v17/v18 is NOT a hardware
+mismatch. Six leaderboard contestants land MetaX 1.17–3.13x with rules-
+compliant Triton kernels. We've been byte-porting FlagGems' broken upstream
+sparse_attention kernel (its CI test is disabled — confirmed via repo dive)
+and inheriting its structural flaws.
 
-- **MTT (0.74 → expected 4+):** Use universal kernel + H_padded=32 (NOT 16).
-  v8 failed because SQMMA needs M >= 32; we used H=16. With H_padded=32 + SQMMA
-  env + (BLOCK=32, num_warps=16, num_stages=6) — exact FlagGems _mthreads
-  recipe — should unlock bf16 tensor core.
-- **MetaX (0.21 → expected 2.5+):** mcTriton autotune over BLOCK 16-64,
-  num_warps 2-8, num_stages 1-3. Plus universal kernel uses accumulator-form
-  `tl.dot(p, kv, acc=acc_o)` (research recommendation from FlagGems flash_mla.py).
-- **Universal kernel improved**: now uses `acc=` form on tl.dot. Should also
-  help Iluvatar (no expected regression, possibly small uplift).
-- Both MTT and MetaX paths wrapped in try/except — fall back to v9 known-good
-  (fp32 for MTT, simple bf16 for MetaX) if the new path crashes.
+Per fla-org/native-sparse-attention parallel.py L703/L758 (the production
+NSA Triton implementation), the canonical fix is **3D grid with V-axis
+chunking**:
+- grid = (m, b, NV) where NV = cdiv(d=512, BV=128) = 4
+- acc_o = [H, BV] not [H, D] — 8 KB per program instead of 32 KB
+- Each program redundantly recomputes QK (cheap relative to PV); the V
+  slice [BLOCK, BV] = 8 KB replaces the full [BLOCK, D] = 32 KB tile
+
+Adds Tier 0 to the MetaX dispatch chain calling the new
+`_sparse_attn_kernel_v19_v_chunked`. Existing v17/v18 tiers preserved as
+Tier 1–5 fallback. Other 4 backends untouched.
+
+v18 (kept) — MetaX env-var probes for 4 compiler passes at module top.
+
+Background on v17 (kept):
+- **Probe 4 MetaX compiler-pass enable env vars** at module top (see import
+  block below). Source: mcTriton compiler.py lines 220, 222, 304, 305.
+- All four default OFF in mcTriton; setting them is a zero-touch experiment:
+  non-MetaX backends never read these names. Most relevant to our kernel:
+  MERGE_CONVERT_LAYOUT (we emit a P bf16-convert between two dots) and
+  MOVE_DOT_OPERANDS_OUT_LOOP (lifts loop-invariant operand loads).
+- No code changes outside the env block. v17's tier 1/2/3 MetaX dispatch
+  preserved. Other 4 backends untouched.
+
+Background on v17 (kept):
+
+Target: MetaX 0.27 → 0.5–0.8 by triggering chain-dot OPT MMA + flashattn-fwd
+LLVM scheduler. Other backends untouched.
+
+Research-validated changes (mcTriton 1122c717 source dive + FlagGems
+_metax/fused/flash_mla.py):
+- **`num_stages=2`** (was unset → defaulted to 3): mcTriton's chain-dot OPT
+  MMA fast path is gated on `numStages == 2` per
+  AccelerateMETAXMatmul.cpp:177-185. With 3 it falls back to the slow path —
+  this is the most likely root cause of the 0.27 ceiling.
+- **`BLOCK=32`** (was 16): FlagGems flash_mla on C500 (compute-cap 8) uses
+  BLOCK_N=32. Larger tile gives the chain-dot opt enough work to use 8 warps.
+- **`pipeline="basic", scenario="flashattn-fwd"`** (NEW MACAOptions kwargs):
+  scenario="flashattn-fwd" activates a hand-tuned LLVM flag preset
+  (mcTriton compiler.py:371-372): `metaxgpu-mma-sched=true`,
+  `metaxgpu-sched-select=metaxgpu-minreg`, `map-use-pk-fma=1` —
+  the minreg scheduler directly addresses our D=512 register pressure.
+
+Tiered fallback if any v17 kwarg is rejected:
+  Tier 1: full v17 (num_stages=2 + BLOCK=32 + MACAOptions kwargs)
+  Tier 2: num_stages=2 + BLOCK=32 only (drop MACAOptions kwargs)
+  Tier 3: v16 byte-exact (BLOCK=16, no num_stages) — our 0.27 floor
+  Tier 4: universal autotune
+  Tier 5: v9 simple bf16
+
+Worst case = Tier 3 = current 0.27. Other backends (Ascend, Iluvatar, Hygon,
+MTT) are not touched — their dispatch paths are byte-identical to v16.
+
+v10 mechanisms preserved for Ascend/Hygon/Iluvatar/MTT (all verified working).
 
 v9 mechanisms preserved for Ascend/Hygon/Iluvatar (all verified working).
 
@@ -62,6 +109,26 @@ FlagOpen/FlagGems runtime/backend/_*/fused/sparse_attention.py (Apache-2.0).
 """
 import os
 os.environ.setdefault("TRITON_DISABLE_SWIZZLE", "1")
+
+# v18: probe additional MetaX (mcTriton) compiler-pass enable flags. All four
+# default to OFF in mcTriton compiler.py; setting them at module load is a
+# zero-touch experiment — non-MetaX backends ignore unknown TRITON_* env vars.
+# Sources (mcTriton commit 1122c717, third_party/metax/backend/compiler.py):
+#   :220 — TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP gates
+#          add_tritonmetaxgpu_move_dot_operands_out_loop_pass (lifts dot
+#          operand loads above the loop, reduces register churn).
+#   :222 — TRITON_ENABLE_MACA_MERGE_CONVERT_LAYOUT gates
+#          add_tritonmetaxgpu_merge_convert_layout_pass (fuses redundant
+#          layout conversions — directly relevant since our chain-dot kernel
+#          emits a P bf16-convert before the second dot).
+#   :304 — TRITON_ENABLE_SMEM_OFFSET_CACHE = scenario "smemOffsetCache".
+#   :305 — TRITON_ENABLE_BSM_INDEX_OPT    = scenario "smemIndexOpt".
+# Worst case any one of these regresses MetaX — each is reversible by a
+# single-flag flip in v19. Other backends never read these names.
+os.environ.setdefault("TRITON_ENABLE_MACA_OPT_MOVE_DOT_OPERANDS_OUT_LOOP", "1")
+os.environ.setdefault("TRITON_ENABLE_MACA_MERGE_CONVERT_LAYOUT", "1")
+os.environ.setdefault("TRITON_ENABLE_SMEM_OFFSET_CACHE", "1")
+os.environ.setdefault("TRITON_ENABLE_BSM_INDEX_OPT", "1")
 
 import torch
 import triton
@@ -712,6 +779,125 @@ def _sparse_attn_kernel_metax_exact(
     tl.store(o_ptrs, acc_o.to(tl.bfloat16), mask=h_mask[:, None])
 
 
+# ===========================================================================
+# v19: NSA-style V-chunked kernel for MetaX
+# ---------------------------------------------------------------------------
+# The 0.27 ceiling we hit through v18 is NOT a hardware ceiling — 6 other
+# leaderboard contestants hit 1.17–3.13x with rules-compliant Triton kernels
+# while we (and inin-zou, who byte-ported the same FlagGems _metax kernel)
+# are stuck at 0.27. FlagGems' _metax/fused/sparse_attention.py is broken
+# upstream (its CI test is disabled), so byte-porting it just inherits its
+# brokenness. Restructured per fla-org/native-sparse-attention parallel.py
+# (L703, L758) — the production NSA Triton implementation.
+#
+# Key structural change: 3D grid (m, b, NV) with NV = cdiv(D, BV). Each
+# program owns acc_o[H, BV] only — at BV=128, that's 8 KB instead of 32 KB,
+# matching NSA's `b_o = tl.zeros([G, BV], fp32)` pattern. acc_o no longer
+# spills out of registers on C500.
+#
+# Cost: each (b, m, v_chunk) program redundantly recomputes the full QK
+# dot. That's O(BLOCK*D) per iter, vs O(BLOCK*BV) for the non-redundant
+# PV dot. Net work increase ~2.5x but parallelism increases 4x and register
+# pressure drops 4x. NSA accepts this trade-off; it's MetaX's binding
+# constraint.
+#
+# All V-chunk programs converge to identical softmax stats (m_i, sum_exp)
+# because the QK pass is deterministic and replicated. Output is correct.
+# ===========================================================================
+@triton.jit
+def _sparse_attn_kernel_v19_v_chunked(
+    Q, KV, O, ATTN_SINK, IDX,
+    stride_qb, stride_qm, stride_qh, stride_qd,
+    stride_kvb, stride_kvn, stride_kvd,
+    stride_ob, stride_om, stride_oh, stride_od,
+    stride_idxb, stride_idxm, stride_idxk,
+    SCALE,
+    TOPK,
+    H_ACTUAL,
+    BLOCK: tl.constexpr,        # topk chunk size
+    D: tl.constexpr,            # full d (used for QK dot)
+    BV: tl.constexpr,           # v-chunk size; acc_o = [H, BV]
+    H: tl.constexpr,            # padded head count
+):
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_v = tl.program_id(2)        # v-axis chunk index
+
+    q_base = Q + pid_b * stride_qb + pid_m * stride_qm
+    offs_h = tl.arange(0, H)
+    offs_d = tl.arange(0, D)
+    offs_bv = pid_v * BV + tl.arange(0, BV)
+    bv_mask = offs_bv < D
+    h_mask = offs_h < H_ACTUAL
+
+    # Load Q full-D once — used for QK dot every iteration.
+    q_ptrs = q_base + offs_h[:, None] * stride_qh + offs_d[None, :] * stride_qd
+    q_block = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0)
+
+    kv_base = KV + pid_b * stride_kvb
+    idx_base = IDX + pid_b * stride_idxb + pid_m * stride_idxm
+
+    acc_o = tl.zeros([H, BV], dtype=tl.float32)         # NSA pattern: per-chunk
+    scores_max = tl.full([H], float("-inf"), dtype=tl.float32)
+    sum_exp = tl.zeros([H], dtype=tl.float32)
+
+    num_blocks = (TOPK + BLOCK - 1) // BLOCK
+    offs_blk = tl.arange(0, BLOCK)
+
+    for t in range(num_blocks):
+        raw_offs = t * BLOCK + offs_blk
+        idx_mask = raw_offs < TOPK
+        idxs = tl.load(idx_base + raw_offs * stride_idxk, mask=idx_mask, other=-1)
+        valid_mask = idxs != -1
+
+        # K load: full D for QK. Live tile [BLOCK, D] bf16 = 32 KB at BLOCK=32.
+        k_ptrs = kv_base + idxs[:, None] * stride_kvn + offs_d[None, :] * stride_kvd
+        k_block = tl.load(k_ptrs, mask=valid_mask[:, None], other=0.0)
+
+        acc_s = tl.dot(q_block, tl.trans(k_block))
+        acc_s = acc_s * SCALE
+        mask_bias = tl.where(valid_mask, 0.0, float("-inf"))
+        acc_s = acc_s + mask_bias[None, :]
+
+        scores_max_prev = scores_max
+        block_max = tl.max(acc_s, axis=1)
+        scores_max = tl.maximum(scores_max, block_max)
+
+        correction = tl.exp(scores_max_prev - scores_max)
+        p = tl.exp(acc_s - scores_max[:, None])
+
+        # V load: only this chunk's BV slice. Tile [BLOCK, BV] bf16 = 8 KB at
+        # BLOCK=32, BV=128. NSA L734 uses make_block_ptr offset by i_v*BV; we
+        # use direct ptr arithmetic since our gather is per-token random.
+        v_ptrs = kv_base + idxs[:, None] * stride_kvn + offs_bv[None, :] * stride_kvd
+        v_block = tl.load(
+            v_ptrs,
+            mask=valid_mask[:, None] & bv_mask[None, :],
+            other=0.0,
+        )
+
+        acc_o = acc_o * correction[:, None]
+        acc_o += tl.dot(p.to(tl.bfloat16), v_block)         # NSA L742 cast pattern
+
+        scores_sum = tl.sum(p, axis=1)
+        sum_exp = sum_exp * correction + scores_sum
+
+    # Sink only contributes to the denominator (sink V is excluded by spec).
+    sink_vals = tl.load(ATTN_SINK + offs_h, mask=h_mask, other=0.0)
+    sum_exp = sum_exp + tl.exp(sink_vals - scores_max)
+
+    acc_o = acc_o / sum_exp[:, None]
+
+    # Write only this chunk's BV slice of the output.
+    o_base = O + pid_b * stride_ob + pid_m * stride_om
+    o_ptrs = o_base + offs_h[:, None] * stride_oh + offs_bv[None, :] * stride_od
+    tl.store(
+        o_ptrs,
+        acc_o.to(tl.bfloat16),
+        mask=h_mask[:, None] & bv_mask[None, :],
+    )
+
+
 # Autotune for Hygon (verified strategy from v7).
 _AUTOTUNE_CONFIGS = [
     triton.Config({'BLOCK_TOPK': 16}, num_warps=2),
@@ -879,14 +1065,67 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, scale):
             )
             return o
 
-    # ---- MetaX (v16): try byte-exact FlagGems metax kernel first ----
-    # We've been at 0.27 with our universal kernel (acc= form). FlagGems
-    # _metax/fused/sparse_attention.py uses += form + num_warps=8 + BLOCK=16
-    # — try it verbatim. Then fall back through several MetaX-specific configs
-    # before giving up to v9 simple bf16.
+    # ---- MetaX (v19): NSA-style V-chunked kernel — primary path ----
+    # The 0.27 → 0.31 ceiling we hit through v18 was NOT a hardware ceiling.
+    # Per leaderboard, 6 other contestants land MetaX 1.17–3.13x with
+    # rules-compliant Triton; we (and inin-zou with the same FlagGems _metax
+    # byte-port) are stuck at 0.27 because we replicate FlagGems' broken
+    # upstream kernel. Restructured per fla-org/native-sparse-attention:
+    # 3D grid (m, b, NV) chunks the d=512 V-axis into NV=cdiv(D, BV) shards.
+    # Each program owns acc_o[H, BV=128] = 8 KB instead of 32 KB — addresses
+    # the register-spill hypothesis. Redundant QK dot per chunk (~2.5x extra
+    # compute) is dwarfed by 4x parallelism + 4x register-pressure drop.
+    # If v19 fails for any reason, fall through to v17/v16 chain-dot path.
     if _is_metax_backend():
         h_padded = max(16, triton.next_power_of_2(h))
-        # Tier 1: byte-exact FlagGems _metax kernel + their config
+        BV = 128
+        # Tier 0: v19 V-chunked NSA-pattern kernel
+        try:
+            NV = (d + BV - 1) // BV
+            grid = (m, b, NV)
+            _sparse_attn_kernel_v19_v_chunked[grid](
+                q_c, kv_c, o, sink_c, idx_c,
+                q_c.stride(0), q_c.stride(1), q_c.stride(2), q_c.stride(3),
+                kv_c.stride(0), kv_c.stride(1), kv_c.stride(2),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                idx_c.stride(0), idx_c.stride(1), idx_c.stride(2),
+                scale,
+                topk,
+                h,
+                BLOCK=32,
+                D=d,
+                BV=BV,
+                H=h_padded,
+                num_warps=4,            # NSA autotune sweeps {1, 2, 4}; 4 conservative
+            )
+            return o
+        except Exception:
+            pass
+
+    # ---- MetaX (v17): activate chain-dot OPT MMA + flashattn-fwd LLVM scheduler ----
+    # Research finding (mcTriton 1122c717 AccelerateMETAXMatmul.cpp:177-185 + 371-381):
+    # MetaX's chain-dot OPT MMA fast path requires num_stages == 2 to fire. Without
+    # it (default 3), our existing byte-port v16 silently took the slow path,
+    # explaining the 0.27 ceiling. FlagGems flash_mla (the closest production
+    # MetaX kernel structurally matching ours — chain dot in loop, bf16 IO) ships
+    # exactly BLOCK_N=32, num_warps=8, num_stages=2 on compute-cap 8 (C500).
+    #
+    # Lead 2 (mcTriton compiler.py:371-372): scenario="flashattn-fwd" activates
+    # MetaX's hand-tuned LLVM flag preset:
+    #   -metaxgpu-mma-sched=true -metaxgpu-sched-select=metaxgpu-minreg
+    #   -map-use-pk-fma=1
+    # The minreg scheduler directly addresses our D=512 register pressure.
+    # pipeline="basic" + scenario="flashattn-fwd" are MACAOptions kwargs;
+    # Triton forwards unknown launch kwargs to backend options. On non-MetaX
+    # backends these would either be ignored or raise — but this branch only
+    # runs on MetaX so other backends are unaffected.
+    #
+    # Tier sequence: Tier 1 (most aggressive: num_stages=2 + BLOCK=32 + MACAOpts)
+    # → Tier 2 (num_stages=2 + BLOCK=32 only, drops MACAOpts if those kwargs fail)
+    # → Tier 3 (v16 byte-exact, our 0.27 floor) → Tier 4 (autotune) → Tier 5 (bf16).
+    if _is_metax_backend():
+        h_padded = max(16, triton.next_power_of_2(h))
+        # Tier 1: chain-dot OPT MMA + flashattn-fwd LLVM preset (full v17)
         try:
             grid = (m, b)
             _sparse_attn_kernel_metax_exact[grid](
@@ -898,10 +1137,55 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, scale):
                 scale,
                 topk,
                 h,
-                BLOCK=16,                      # FlagGems metax exact
+                BLOCK=32,                          # was 16; FlagGems flash_mla C500 uses 32
                 D=d,
                 H=h_padded,
-                num_warps=8,                   # FlagGems metax exact
+                num_warps=8,
+                num_stages=2,                      # KEY: enables chain-dot OPT MMA
+                pipeline="basic",                  # MACAOptions: standard pipeline
+                scenario="flashattn-fwd",          # MACAOptions: hand-tuned LLVM preset
+            )
+            return o
+        except Exception:
+            pass
+        # Tier 2: drop MACAOptions kwargs in case Triton's launcher rejects them,
+        # but keep num_stages=2 + BLOCK=32 (the chain-dot OPT trigger).
+        try:
+            grid = (m, b)
+            _sparse_attn_kernel_metax_exact[grid](
+                q_c, kv_c, o, sink_c, idx_c,
+                q_c.stride(0), q_c.stride(1), q_c.stride(2), q_c.stride(3),
+                kv_c.stride(0), kv_c.stride(1), kv_c.stride(2),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                idx_c.stride(0), idx_c.stride(1), idx_c.stride(2),
+                scale,
+                topk,
+                h,
+                BLOCK=32,
+                D=d,
+                H=h_padded,
+                num_warps=8,
+                num_stages=2,
+            )
+            return o
+        except Exception:
+            pass
+        # Tier 3: v16 byte-exact FlagGems _metax config — our known 0.27 floor.
+        try:
+            grid = (m, b)
+            _sparse_attn_kernel_metax_exact[grid](
+                q_c, kv_c, o, sink_c, idx_c,
+                q_c.stride(0), q_c.stride(1), q_c.stride(2), q_c.stride(3),
+                kv_c.stride(0), kv_c.stride(1), kv_c.stride(2),
+                o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+                idx_c.stride(0), idx_c.stride(1), idx_c.stride(2),
+                scale,
+                topk,
+                h,
+                BLOCK=16,
+                D=d,
+                H=h_padded,
+                num_warps=8,
             )
             return o
         except Exception:

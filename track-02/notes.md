@@ -372,6 +372,229 @@ device name string) logic. Cached results in module-level flags.
 
 ---
 
+## v6 platform results — 2026-05-06
+
+🥈 **#2 globally with avg 71.85x.** Lost #1 to mdzaidlm1019 @ 117.69.
+
+| Backend       | v5     | v6         | diff   |
+|---------------|--------|------------|--------|
+| 华为昇腾       | 7.41   | **7.51**   | +0.10  |
+| 天数 Iluvatar  | 74.23  | 74.68      | +0.45  |
+| 海光 Hygon     | 52.22  | 54.23      | +2.01  |
+| 摩尔线程 MTT   | 146.43 | **201.32** | **+54.89** 🚀 |
+| 沐曦 MetaX     | 21.32  | 21.51      | +0.19  |
+| **avg**       | 60.32  | **71.85**  | +11.53 |
+
+MTT jumped much more than predicted (+54 vs predicted +5), almost certainly
+because BLOCK_T=128 num_warps=8 was actually a great config and v2 had only
+tested num_warps=4. Ascend bypass also recovered the +0.10.
+
+**Competitor analysis:** mdzaidlm1019 has Ascend=1.00 (essentially baseline,
+not failed=0 — the platform reports 0.00 for failed runs), Iluvatar=45.07,
+Hygon=28.36, **MTT=499.82**, MetaX=14.20. They're worse than us on 4 of 5
+backends but their MTT is 2.49× ours, and the arithmetic mean lets that one
+score dominate. Their strategy: optimize MTT to the moon, leave others at
+baseline. We need to either (a) match their MTT while keeping our floor, or
+(b) accept the same trade.
+
+---
+
+## v7 — 2026-05-06
+
+**Strategy: expand autotune sweep on the MTT-relevant axis.**
+
+v6's autotune sweep had two unexplored dimensions:
+1. **`num_stages`** never set anywhere → defaults to 1. NV-style backends
+   typically benefit from `num_stages=2/3` software pipelining.
+2. **`BLOCK_T` capped at 128.** Per-token register footprint is just 16 fp32
+   (`comb` 4×4) ≈ 64 B, so 256-token tiles should fit easily.
+
+**Changes:**
+- Added 4 `num_stages=2/3` configs at BLOCK_T 64/128.
+- Added 4 BLOCK_T=256 configs (with and without pipelining).
+- Total configs: 11 → 19.
+
+**Risk model:**
+- Hygon / Iluvatar / MTT (all autotune consumers): NV-style upstream
+  Triton skips uncompilable configs gracefully → upside-only.
+- Ascend / MetaX: bypass autotune entirely → unaffected.
+- First-call autotune cost: 19 × 5 distinct n = 95 compile/bench. Higher
+  warm-up cost than v6, but `triton.testing.do_bench` does its own warmup
+  before timing. Should be fine.
+
+**Expected outcome (per backend, conservative → optimistic):**
+- MTT: 201 → 250–400 if pipelining or BLOCK_T=256 helps.
+- Hygon: 54 → 55–65 (already well-tuned, small upside).
+- Iluvatar: 75 → 75–85 (small upside).
+- Ascend / MetaX: unchanged.
+
+**Worst case:** autotune still picks v6's BLOCK_T=128, num_warps=8 → score
+identical to v6 → 71.85. No regression risk because new configs are pure
+additions.
+
+**Submit, observe, decide v8.**
+
+---
+
+## v7 platform results — 2026-05-06 (FAILED, all 5 backends)
+
+| Backend       | v6     | v7     | diff |
+|---------------|--------|--------|------|
+| 华为昇腾       | 7.51   | failed | ❌   |
+| 天数 Iluvatar  | 74.68  | failed | ❌   |
+| 海光 Hygon     | 54.23  | failed | ❌   |
+| 摩尔线程 MTT   | 201.32 | failed | ❌   |
+| 沐曦 MetaX     | 21.51  | failed | ❌   |
+
+All 5 failed simultaneously → module-level breakage. Hypothesis at the time:
+`triton.Config(..., num_stages=2)` rejected by some vendor fork's Config
+class at module import. **Subsequent research disproved this** — every fork
+(upstream 3.5.x, FlagTree main + metax/mthreads/hcu overrides, Triton-Ascend
+3.5.0, Iluvatar) accepts `num_stages` in `Config.__init__`. The actual cause
+was almost certainly a **specific (BLOCK_T, num_warps, num_stages) corner
+in the sweep crashing one or more backends' compilers uncatchably**.
+
+---
+
+## v7b platform results — 2026-05-06 (regressed)
+
+Defensive `_make_config` wrapper + dropped `num_stages`, kept BLOCK_T=256/512.
+
+| Backend       | v6     | v7b    | diff   |
+|---------------|--------|--------|--------|
+| 华为昇腾       | 7.51   | 7.70   | +0.19  |
+| 天数 Iluvatar  | 74.68  | 74.94  | +0.26  |
+| 海光 Hygon     | 54.23  | 50.60  | -3.63 ❌|
+| 摩尔线程 MTT   | 201.32 | 154.99 | -46.33 ❌|
+| 沐曦 MetaX     | 21.51  | 21.28  | -0.23  |
+| **avg**       | 71.85  | 61.90  | -9.95  |
+
+MTT regression: autotune picked one of the new BLOCK_T=256/512 configs as
+"winner" in its noisy micro-bench, but the picked config is slower than v6's
+BLOCK_T=128 winner on the actual workload. Hygon similar mechanism.
+
+**Lesson**: adding configs to autotune is NOT free upside. Without local
+benchmark capability, every speculative addition risks autotune picking a
+noise-driven false positive.
+
+---
+
+## Research pass: FlagGems MUSA non-MMA configs (2026-05-06)
+
+Cloned `FlagOpen/FlagGems` master and surveyed `src/flag_gems/runtime/backend/_mthreads/`.
+Goal: find evidence-backed configs for non-MMA reduction-style kernels on
+muTriton, since our `hc_split_sinkhorn` is structurally that.
+
+Key findings:
+
+1. **`num_stages>1` IS safe inside `@triton.autotune` on MUSA for non-MMA
+   ops** — FlagGems ships amax/max/argmin/prod/log/celu with mixed
+   `num_stages=1, num_stages=2` configs in autotune sweeps that pass MUSA CI.
+   The cap is **num_stages ≤ 2** for reductions; ≥3 only appears in GEMM
+   paths (mm/mv/nonzero).
+2. **Closest analog kernel**: `cross_entropy_loss` — per-token softmax over
+   tiny axis + pointwise. Same structural pattern as ours. Its MUSA config:
+   `BLOCK_C ∈ {256, 512, 1024}, num_warps=4, no num_stages set`.
+3. **`_num_warps()` heuristic** (`heuristics_config_utils.py:35-42`): for
+   block sizes 128–256, FlagGems picks `num_warps=4`.
+4. No public muTriton non-MMA tutorial. FlagGems is the only public
+   reference for what works on MUSA.
+5. `MUSA_ENABLE_SQMMA=1` is only relevant for MMA paths. Our fp32 reduction
+   kernel doesn't need it; no other MUSA env vars matter for this case.
+
+---
+
+## v8 — 2026-05-06
+
+**Strategy: MTT-explicit path based on FlagGems CE-loss MUSA pattern.**
+
+Changes from v6:
+- Added `_is_mtt_backend()` (`backend == "musa"`) detection.
+- New explicit MTT path in wrapper, bypassing autotune entirely:
+  - prefill (n > 64): `BLOCK_T=256, num_warps=4` (no `num_stages`)
+  - decode (n ≤ 64): `BLOCK_T=next_pow2(n), num_warps=1`
+- MTT added to `skip_autotune` so failed-explicit-path falls into static, not autotune.
+- Reverted `_AUTOTUNE_CONFIGS` to v6's exact 11 entries (no v7b additions).
+- Removed `_make_config` defensive wrapper — only used in v7b, no longer needed.
+
+**Why this should beat v6 MTT=201:**
+- v6 autotune picked BLOCK_T=128 num_warps=8 as winner. FlagGems MUSA sweet
+  spot for reductions is BLOCK ∈ [256, 1024] with num_warps=4. v6's choice
+  is below MUSA's optimum band.
+- BLOCK_T=256 ships as a default in FlagGems' production MUSA backend ops,
+  so we know it compiles cleanly and runs correctly — no crash risk.
+
+**Why this can't make v6 worse on other backends:**
+- Hygon, Iluvatar: identical to v6 (autotune sweep restored, MTT branch
+  inert because `_is_mtt_backend()` returns False).
+- Ascend, MetaX: identical to v6 (still bypass to static).
+
+**Risk:**
+- If our hypothesis is wrong and MUSA actually prefers BLOCK_T=128 num_warps=8,
+  MTT regresses from 201 to whatever 256/4 gives. Bounded downside — we
+  can't fail since the config is FlagGems-validated. Worst case is a small
+  regression on MTT only.
+- Platform takes best, so failure mode = wasted submission, not lost rank.
+
+**Expected outcome:**
+- MTT: 201 → 250–350 (if FlagGems analog holds)
+- Other backends: identical to v6
+- Avg: 71.85 → ~80–100
+
+---
+
+## v8 platform results — 2026-05-06 (regressed badly)
+
+| Backend       | v6     | v8     | diff    |
+|---------------|--------|--------|---------|
+| 华为昇腾       | 7.51   | 7.41   | -0.10   |
+| 天数 Iluvatar  | 74.68  | 78.21  | +3.53 ✓ |
+| 海光 Hygon     | 54.23  | 52.18  | -2.05   |
+| 摩尔线程 MTT   | 201.32 | **92.32** | **-108.83** ❌❌❌ |
+| 沐曦 MetaX     | 21.51  | 21.35  | -0.16   |
+| **avg**       | 71.85  | 50.30  | -21.55  |
+
+**The FlagGems CE-loss analogy was structurally wrong.** CE-loss processes
+`[BATCH, C]` where C is vocab size (~32k) — per-row compute is enormous
+relative to the row count. Its `BLOCK_C=256, num_warps=4` choice optimizes
+for that ratio.
+
+Our kernel is the inverse: per-token compute is tiny (4-element softmax + 39
+4-element reductions = ~160 ops/token) and we have many tokens. v6's
+autotune-picked `BLOCK_T=128, num_warps=8` is actually the correct shape:
+- 8 warps × 32 = 256 threads, 128 tokens → 2 threads / token → parallelism
+  for the 4-element axis reductions
+- vs v8's 4 warps × 32 = 128 threads, 256 tokens → 0.5 threads / token →
+  serial processing per thread, lower parallelism on the inner axis
+
+**Lesson**: per-row compute size is a first-order parameter that determines
+the BLOCK / num_warps trade-off. FlagGems' MUSA non-MMA kernels span
+dropout (huge per-row), CE-loss (huge), layer_norm (huge), batch_norm
+(small). Only batch_norm has a similar shape to ours, and it doesn't use
+autotune (heuristic-derived). No public MUSA kernel resembles "tiny
+per-token + many tokens" closely enough to transfer configs.
+
+---
+
+## v9 = exact v6 revert — 2026-05-06
+
+3 blind tunings (v7, v7b, v8) all hurt. Without local muTriton hardware to
+bench, we cannot reliably beat v6's autotune on MTT. Reverting to exactly
+v6 to restore the 71.85 / #2 baseline.
+
+Changes: removed `_is_mtt_backend`, `_IS_MTT_CACHED`, the explicit MTT
+dispatch path, and any v7b/v8 residue. Result is byte-equivalent (modulo
+docstring) to the v6 file that scored 71.85.
+
+**Conclusion on track-02 MTT optimization**: parked. To go further we
+need either (a) muTriton hardware to bench candidate configs locally, or
+(b) a fundamentally different algorithm (not just config tuning) — e.g.,
+fewer sinkhorn iterations via convergence detection, or a closed-form
+doubly-stochastic projection. Both are higher risk and orthogonal to
+config-level work.
+
+---
+
 ## Notes on workload mix
 
 - Three of four scenarios are **decode-dominant** (99.8% calls).
@@ -380,6 +603,137 @@ device name string) logic. Cached results in module-level flags.
   If our decode kernel suffers on prefill, this workload will tank.
 - The bench script's `weighted` row uses the per-workload call frequencies
   — that's the number we actually want to maximize.
+
+## Leaderboard reset — 2026-05-06
+
+User pulled the latest leaderboard. Several new entries massively pushed MTT:
+
+| Rank | Player | Ascend | Iluvatar | Hygon | MTT | MetaX | avg |
+|------|--------|--------|----------|-------|-----|-------|-----|
+| 1 | flagos | 13.32 | – | 63.80 | **520.67** | **26.28** | 124.81 |
+| 2 | 1550266278 | 12.68 | – | 34.25 | 538.60 | 15.85 | 120.28 |
+| 3 | mdzaidlm1019 | 1.00 | 45.07 | 28.36 | 499.82 | 14.20 | 117.69 |
+| 4 | farid (GOSIM) | 8.44 | 55.46 | 30.12 | 292.93 | 14.73 | 80.33 |
+| **5** | **us (GOSIM)** | 7.51 | **74.68** | **54.23** | 201.32 | **21.51** | 71.85 |
+
+Strategic situation:
+- **We're #1 on Iluvatar (74.68)**, #1 on Hygon (54.23), #2 on MetaX (21.51).
+- We're losing primarily on MTT (201 vs 290–540).
+- **farid is our direct GOSIM Winner competitor** (also has GOSIM tag).
+  Beating farid requires avg ≥ 80.33.
+- MTT 201 → ~290 with all else equal would give us avg = (7.51+74.68+54.23+290+21.51)/5 = 89.6 → beat farid for GOSIM Winner.
+- We can't bench MTT locally; track-02 v7-v8 confirmed blind MTT changes
+  are dangerous. Pivoting to MetaX where the gap is achievable: 21.51 → 26+
+  matches #1 and adds another #1 backend to our wins.
+
+---
+
+## Deep research: MetaX track-02 specific (~200 tool calls) — 2026-05-06
+
+Surveyed MetaX-MACA org (vLLM-metax, mcTriton, mcoplib, TileKernels-Metax,
+McFlashInfer, flashattn), FlagGems _metax/, vLLM upstream, DeepSeek
+TileKernels, Chinese tech sources, GOSIM forum. 185 tool calls.
+
+**Decisive finding**: **MetaX-MACA/TileKernels-Metax** (created 2026-04-29)
+is DeepSeek's mHC TileKernels port to MetaX. It contains
+`tile_kernels/mhc/pre_big_fuse_kernel.py` with `tests/mhc/test_pre_big_fuse.py`
+testing **the exact operation our `hc_split_sinkhorn` implements**.
+
+DeepSeek's MetaX reference uses:
+- 1 program per token (`T.Kernel(num_tokens, threads=96)`)
+- 96 threads = 1.5 warps × 64 ≈ Triton `num_warps=2`
+- `TL_DISABLE_VECTORIZE_256: True` — 256-bit vectorization HURTS on MetaX
+
+**MetaX-MACA/vLLM-metax/.../fused_moe.py:1554-1594** is vendor-shipping
+production code with size-dependent heuristic:
+```
+M ≤ 32 → block_m = 16
+M ≤ 128 → num_warps = 4
+else → num_warps = 8
+```
+Plus line 1518 explicit comment: `num_stages > 2 OOMs on Maca`. They
+hardcode `num_stages_maca = 2`.
+
+**MetaX-MACA/mcoplib c500-optimization-guide.md** (official MetaX repo,
+HEAD 2026-05-06):
+- 104 SMs (grid sizes should be multiples of 104)
+- **Warp size = 64** (NOT 32 like NVIDIA — `num_warps=N` in Triton =
+  N × 64 threads on MetaX!)
+- 64 K registers / SM (256 regs/thread max)
+- 64 KB shared memory / SM
+- "Reduction: Threads/Block 512–1024, Warps 16–32" (= num_warps=8 in Triton)
+
+**FlagGems `_metax` non-MMA kernels survey** (the closest analogs to ours):
+| Op | Configs |
+|----|---------|
+| log_softmax | N≤1024→num_warps=1, ≤2048→4, else 8 |
+| dropout | N≤512→warps=4, ≤1024→8, else **16** |
+| layer_norm_loop | TILE_N ∈ {1024, 2048, 4096, 8192}, num_warps ∈ {4, 8, 16} |
+| mean/sum reductions | BLOCK_M ∈ {1,2,4,8}, num_warps=4 fixed |
+
+**Anti-leads (confirmed from research)**:
+- `pipeline="cpasync"` — only fires when MMA optimizer is on; useless for our
+  non-MMA kernel
+- `scenario="flashattn-fwd"` / `"mla"` — MMA-specific, won't help us
+- `num_stages > 2` — explicit OOM crash per vLLM-MetaX comment
+- `num_warps=16` for our 4-element reduction axis — wastes occupancy
+  (60+ idle threads / reduction)
+- Adding `num_stages` to autotune sweep — v7 confirmed crashes
+
+---
+
+## v10 — 2026-05-06
+
+**Strategy: codify vllm-metax + DeepSeek TileKernels patterns into MetaX-only static config.**
+
+Single change to wrapper. New `_metax_static_config(n)`:
+```python
+def _metax_static_config(n: int):
+    if n <= 64:    return 16, 1   # decode — v9 verified 21.51
+    if n <= 512:   return 32, 4
+    if n <= 8192:  return 64, 4
+    return 128, 8                 # large prefill — vllm-metax M>128
+```
+
+Static path now branches: MetaX uses `_metax_static_config` + `num_stages=1`,
+Ascend keeps `_static_config = (16, 1)` per v4 lesson. Try/except wraps
+the num_stages=1 launch — if rejected, retries without num_stages (= v9
+behavior at the new size-dependent BLOCK_T).
+
+**Workload impact**:
+| Workload | Frequency | n | v9 config | v10 config |
+|----------|-----------|---|-----------|------------|
+| 16k-1k-1 decode | 99.8% | 1 | (16, 1) | (16, 1) [unchanged] |
+| 16k-1k-1 prefill | 0.2% | 16384 | (16, 1) | **(128, 8)** |
+| 4k-1k-16 decode | 99.8% | 16 | (16, 1) | (16, 1) [unchanged] |
+| 4k-1k-16 prefill | 0.2% | 65536 | (16, 1) | **(128, 8)** |
+| 1k-1k-64 decode | 99.8% | 64 | (16, 1) | (16, 1) [unchanged] |
+| 1k-1k-64 prefill | 0.2% | 65536 | (16, 1) | **(128, 8)** |
+| **1k-1-64 decode** | **33%** | 64 | (16, 1) | (16, 1) [unchanged] |
+| **1k-1-64 prefill** | **67%** | 65536 | (16, 1) | **(128, 8)** ⭐ |
+
+The 1k-1-64 prefill path (67% of calls in that workload) is the primary
+beneficiary. Other 3 workloads' decode (99%) is unchanged.
+
+**Risk model:**
+- Decode (16, 1) unchanged → v9's 21.51 floor preserved on the 99% path.
+- Prefill bumped to (128, 8) — vendor-validated config that ships in
+  vllm-metax production. Compile failure unlikely; performance regression
+  at worst.
+- num_stages=1 wrapped in try/except. If MACA OOMs (per vLLM comment, only
+  >2 OOMs but be safe), falls back to no num_stages.
+- Other backends UNTOUCHED.
+
+**Expected outcomes:**
+- Best case: MetaX 21.51 → 28-32 (matches/beats #1 flagos at 26.28). Avg
+  71.85 → ~73-75. Still need MTT for GOSIM Winner threshold.
+- Realistic: MetaX 21.51 → 24-26. Avg 71.85 → ~72-73.
+- Null: prefill bump didn't help (compute-axis bound, not parallelism).
+  Decode unchanged → MetaX = 21.51, avg = 71.85.
+
+**Submit, observe.**
+
+---
 
 ## Decision log
 
